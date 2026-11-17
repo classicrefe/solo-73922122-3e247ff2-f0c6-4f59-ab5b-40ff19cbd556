@@ -75,7 +75,10 @@ def main() -> None:
         stops.append(stop)
         env = {
             **os.environ,
-            "PYTHONPATH": str(ROOT),
+            # 追加 ROOT：保留调用环境已有的依赖路径（venv / 外部 PYTHONPATH）。
+            "PYTHONPATH": os.pathsep.join(
+                p for p in [str(ROOT), os.environ.get("PYTHONPATH")] if p
+            ),
             "DATA_DIR": str(data_dir),
             "INSTANCE_NAME": f"node{idx + 1}",
             "METLAKE_STOP_FILE": str(stop),
@@ -204,7 +207,83 @@ def main() -> None:
         files = list((data_dir / "parquet").glob("*.parquet"))
         check("拒绝的上传未留下 Parquet", len(files) == 2, [p.name for p in files])
 
-        # 7. 下载与完整性
+        # 7. 缺测核对：生成、跨实例过期、无关补传不影响、刷新恢复
+        gap_window = {
+            "station_id": "54511",
+            "start_at": "2026-01-01T00:00:00Z",
+            "end_at": "2026-01-01T02:00:00Z",
+            "interval_minutes": 60,
+        }
+        # 既有批次含 54511 @ 2026-01-01T00:00（old 批次）
+        gap = httpx.post(f"{A}/api/gap-reports", json=gap_window, timeout=30)
+        check("A 生成缺测报告", gap.status_code == 201, gap.text[:160])
+        gap_body = gap.json()
+        gid = gap_body["id"]
+        check("报告初始为当前且网格 3 点",
+              gap_body["status"] == "current" and gap_body["point_count"] == 3,
+              gap_body["status"])
+        check("首点已观测、其余缺测",
+              gap_body["observed_count"] == 1 and gap_body["missing_count"] == 2,
+              (gap_body["observed_count"], gap_body["missing_count"]))
+        check("连续缺测区间为 01:00->02:00 一段",
+              len(gap_body["missing_intervals"]) == 1
+              and gap_body["missing_intervals"][0]["start_at"] == "2026-01-01T01:00:00Z"
+              and gap_body["missing_intervals"][0]["end_at"] == "2026-01-01T02:00:00Z",
+              gap_body["missing_intervals"])
+
+        # 无关站号补传：报告保持当前
+        irrelevant = httpx.post(
+            f"{B}/api/batches",
+            data={"version": v},
+            files={"file": ("other.csv", csv_bytes(
+                ["station_id", "observed_at", "temp_c"],
+                [["99999", "2026-01-01T01:00:00Z", "1"]],
+            ), "text/csv")},
+            timeout=30,
+        )
+        check("无关站号补传成功", irrelevant.status_code == 201, irrelevant.text[:120])
+        still_current = httpx.get(f"{A}/api/gap-reports/{gid}").json()
+        check("无关补传不使报告过期", still_current["status"] == "current",
+              still_current["status"])
+
+        # 相关站号窗口内补传：在 B 上传，A 立即看到过期
+        backfill = httpx.post(
+            f"{B}/api/batches",
+            data={"version": v},
+            files={"file": ("backfill.csv", csv_bytes(
+                ["station_id", "observed_at", "temp_c"],
+                [["54511", "2026-01-01T01:00:00Z", "3"]],
+            ), "text/csv")},
+            timeout=30,
+        )
+        check("相关补传成功", backfill.status_code == 201, backfill.text[:120])
+        stale_gap = httpx.get(f"{A}/api/gap-reports/{gid}").json()
+        check("A 立即看到报告过期且记录原因批次",
+              stale_gap["status"] == "stale"
+              and stale_gap["stale_reason_batch_id"] == backfill.json()["id"],
+              (stale_gap["status"], stale_gap["stale_reason_batch_id"]))
+        check("过期后旧结论保留", stale_gap["missing_count"] == 2,
+              stale_gap["missing_count"])
+        list_page = httpx.get(f"{B}/gaps")
+        detail_page = httpx.get(f"{A}/gaps/{gid}")
+        check("缺测网页列表与详情可打开",
+              list_page.status_code == 200 and detail_page.status_code == 200
+              and "过期" in detail_page.text)
+
+        # 刷新：按当前批次重算为当前
+        refreshed = httpx.post(f"{A}/api/gap-reports/{gid}/refresh", timeout=30).json()
+        check("刷新后恢复当前并纳入补传",
+              refreshed["status"] == "current"
+              and refreshed["observed_count"] == 2
+              and refreshed["missing_count"] == 1,
+              (refreshed["status"], refreshed["observed_count"], refreshed["missing_count"]))
+        check("刷新后依据批次含补传批次",
+              backfill.json()["id"] in refreshed["basis_batch_ids"],
+              refreshed["basis_batch_ids"])
+        check("无关批次不进入依据集合",
+              irrelevant.json()["id"] not in refreshed["basis_batch_ids"])
+
+        # 8. 下载与完整性
         csv_dl = httpx.get(f"{A}/api/batches/{new.json()['id']}?format=csv")
         expected_header = httpx.get(f"{A}/api/schema").json()
         names = ["station_id", "observed_at"] + [f["name"] for f in expected_header["fields"]]
@@ -213,7 +292,7 @@ def main() -> None:
         pq_dl = httpx.get(f"{A}/api/batches/{new.json()['id']}?format=parquet")
         check("下载当前列名 Parquet", pq_dl.status_code == 200 and len(pq_dl.content) > 100)
         integrity = httpx.get(f"{A}/api/integrity").json()
-        check("双实例一致性自检", integrity["ok"] and integrity["batches"] == 2, integrity)
+        check("双实例一致性自检", integrity["ok"] and integrity["batches"] == 4, integrity)
         page = httpx.get(f"{B}/")
         check("网页可打开展示过期提示", page.status_code == 200)
         print("\n全部端到端检查通过。")

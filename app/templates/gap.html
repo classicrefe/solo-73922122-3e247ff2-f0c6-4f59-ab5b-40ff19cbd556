@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>缺测报告 {{ report.short_id }} · 气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>缺测报告 {{ report.short_id }}</h1>
+  <span class="sub">站号 {{ report.station_id }} · {{ report.interval_minutes }} 分钟网格</span>
+  <span class="instance">实例 {{ settings.instance_name }}</span>
+</header>
+
+<main>
+  <div class="crumbs"><a href="/gaps">← 返回缺测核对</a> · <a href="/">数据湖</a></div>
+  {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+
+  {% if report.status == 'stale' %}
+  <div class="flash error">
+    本报告已<strong>过期</strong>：生成/上次刷新之后，出现了本站号且落在窗口内的补传批次
+    {% if report.stale_reason_batch_id %}
+      <code>{{ report.stale_reason_batch_id[:8] }}</code>
+      （{% if report.stale_reason_batch_id in batches_by_id %}<a href="/batches/{{ report.stale_reason_batch_id }}">查看该批次</a>，{% endif %}过期时刻 {{ report.stale_at }} UTC）
+    {% endif %}
+    。下方结论与批次集合仍完整保留，但不再代表当前状态；请点击“按当前批次重新计算”。
+  </div>
+  {% else %}
+  <div class="flash ok">本报告为<strong>当前</strong>状态：结论与依据批次集合来自同一个已提交状态。</div>
+  {% endif %}
+
+  <section class="panel">
+    <h2>
+      核对条件与结论
+      {% if report.status == 'current' %}
+        <span class="badge ok">当前</span>
+      {% else %}
+        <span class="badge err">过期</span>
+      {% endif %}
+    </h2>
+    <dl class="meta">
+      <dt>报告 ID</dt><dd>{{ report.id }}</dd>
+      <dt>站号</dt><dd>{{ report.station_id }}</dd>
+      <dt>UTC 窗口</dt><dd>{{ report.start_at.strftime('%Y-%m-%d %H:%M') }} → {{ report.end_at.strftime('%Y-%m-%d %H:%M') }}（含端点）</dd>
+      <dt>采样间隔</dt><dd>{{ report.interval_minutes }} 分钟</dd>
+      <dt>网格点</dt><dd>{{ report.point_count }} 个</dd>
+      <dt>已观测</dt><dd>{{ report.observed_count }} 个（跨批重复时刻只算一次）</dd>
+      <dt>缺测</dt><dd><strong>{{ report.missing_count }}</strong> 个</dd>
+      <dt>连续缺测区间</dt><dd>{{ report.intervals|length }} 段</dd>
+      <dt>依据批次</dt><dd>{{ report.basis_batch_ids|length }} 个（计算时全湖登记 {{ report.snapshot_batch_count }} 批）</dd>
+      <dt>生成时间</dt><dd>{{ report.created_at }} UTC</dd>
+      <dt>计算时间</dt><dd>{{ report.computed_at }} UTC</dd>
+      <dt>最近刷新</dt><dd>{{ report.refreshed_at }} UTC</dd>
+    </dl>
+    <form method="post" action="/gaps/{{ report.id }}/refresh" style="margin-top:14px">
+      <button type="submit">按当前批次重新计算（刷新报告）</button>
+    </form>
+    <div class="notice info">
+      刷新在单个事务内复核计算期间的新批次：若又有相关补传，报告保持过期且本次中间结论不落库，
+      旧报告原样保留；无相关补传时才更新为当前结论。核对期间上传功能不受影响。
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>连续缺测区间 <span class="hint">交给补采人员的连续时段（含端点）</span></h2>
+    {% if report.intervals %}
+    <table class="data">
+      <thead><tr><th>#</th><th>开始 (UTC)</th><th>结束 (UTC)</th><th>缺测点数</th></tr></thead>
+      <tbody>
+      {% for interval in report.intervals %}
+        <tr>
+          <td class="muted num">{{ loop.index }}</td>
+          <td class="num">{{ interval.start_at.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td class="num">{{ interval.end_at.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td class="num">{{ interval.point_count }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">窗口内所有网格时刻均已观测，无连续缺测区间。</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>依据批次 <span class="hint">报告结论所依据的已登记批次；跨批重复时刻已去重</span></h2>
+    {% if report.basis_batch_ids %}
+    <table class="data">
+      <thead><tr><th>批次</th><th>入湖时间 (UTC)</th><th>行数</th><th></th></tr></thead>
+      <tbody>
+      {% for bid in report.basis_batch_ids %}
+        <tr>
+          {% set batch = batches_by_id.get(bid) %}
+          <td><code>{{ bid[:8] }}</code></td>
+          <td class="num">{{ batch.created_at if batch else '—' }}</td>
+          <td class="num">{{ batch.row_count if batch else '—' }}</td>
+          <td><div class="row-actions">
+            {% if batch %}<a href="/batches/{{ bid }}">查看</a>{% else %}<span class="muted">批次已不存在</span>{% endif %}
+          </div></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">窗口内没有任何该站号的已登记观测，全部网格点均为缺测。</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>
+      时间网格明细
+      <span class="badge gray">{{ report.point_count }} 点</span>
+      <span class="hint">非网格时刻不抵缺测，见文末清单</span>
+    </h2>
+    <div class="table-scroll">
+      <table class="data">
+        <thead><tr><th>网格时刻 (UTC)</th><th>状态</th><th>登记来源批次（去重）</th></tr></thead>
+        <tbody>
+        {% for point in report.grid %}
+          <tr>
+            <td class="num">{{ point.observed_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            {% if point.observed %}
+            <td><span class="badge ok">已观测</span></td>
+            <td>
+              {% for bid in point.batch_ids %}
+                <code>{{ bid[:8] }}</code>{% if not loop.last %}，{% endif %}
+              {% endfor %}
+            </td>
+            {% else %}
+            <td><span class="badge err">缺测</span></td>
+            <td class="muted">—</td>
+            {% endif %}
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>非网格观测 <span class="hint">不计入缺测抵扣；仅登记备查</span></h2>
+    {% if report.offgrid %}
+    <div class="table-scroll">
+      <table class="data">
+        <thead><tr><th>观测时刻 (UTC)</th><th>所属批次</th></tr></thead>
+        <tbody>
+        {% for item in report.offgrid %}
+          <tr>
+            <td class="num">{{ item.observed_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+            <td><code>{{ item.batch_id[:8] }}</code></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="muted">没有非网格时刻的观测。</p>
+    {% endif %}
+  </section>
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 报告持久保存；相关站号在窗口内补传后立即标为过期，无关补传不影响状态。
+</footer>
+</body>
+</html>

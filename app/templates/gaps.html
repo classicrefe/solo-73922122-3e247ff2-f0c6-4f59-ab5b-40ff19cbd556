@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>缺测核对 · 气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>缺测核对</h1>
+  <span class="sub">按站号与 UTC 时间网格汇总已登记批次，输出连续缺测区间</span>
+  <span class="instance">实例 {{ settings.instance_name }}</span>
+</header>
+
+<main>
+  <div class="crumbs"><a href="/">← 返回数据湖</a></div>
+  {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+
+  <section class="panel">
+    <h2>新建缺测核对 <span class="hint">网格含起止端点；跨度 ≤ 24 小时，且须被采样间隔整除</span></h2>
+    <form class="gap-form" method="post" action="/gaps">
+      <label>
+        站号
+        <input type="text" name="station_id" list="known-stations" required
+               maxlength="256" placeholder="如 54511" autocomplete="off">
+      </label>
+      <datalist id="known-stations">
+        {% for station in stations %}<option value="{{ station }}"></option>{% endfor %}
+      </datalist>
+      <label>
+        UTC 开始时刻（含）
+        <input type="datetime-local" name="start_at" id="start-at" required step="60">
+      </label>
+      <label>
+        UTC 结束时刻（含）
+        <input type="datetime-local" name="end_at" id="end-at" required step="60">
+      </label>
+      <label>
+        采样间隔（分钟）
+        <select name="interval_minutes" id="interval-minutes">
+          {% for value in intervals %}<option value="{{ value }}">{{ value }} 分钟</option>{% endfor %}
+        </select>
+      </label>
+      <div class="gap-actions"><button type="submit">生成核对报告</button></div>
+    </form>
+    <div class="notice info">
+      时刻一律按 UTC 解释（浏览器控件显示的数值即 UTC 数值，请按 UTC 填写）。
+      跨批重复登记的同一网格时刻只算一次；非网格时刻不抵缺测，会在报告中单独列出。
+      核对期间仍可正常上传；计算中若发生相关补传，报告会直接落为“过期”而非“当前”。
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>核对报告 <span class="hint">共 {{ reports|length }} 份；刷新可按最新已提交批次重算</span></h2>
+    {% if reports %}
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>报告</th>
+            <th>站号</th>
+            <th>UTC 窗口（含端点）</th>
+            <th>间隔</th>
+            <th>状态</th>
+            <th>缺测/网格</th>
+            <th>连续缺测</th>
+            <th>依据批次</th>
+            <th>生成时间 (UTC)</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for report in reports %}
+          <tr>
+            <td><a href="/gaps/{{ report.id }}"><code>{{ report.short_id }}</code></a></td>
+            <td><strong>{{ report.station_id }}</strong></td>
+            <td class="num">{{ report.start_at.strftime('%Y-%m-%d %H:%M') }} → {{ report.end_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td class="num">{{ report.interval_minutes }} min</td>
+            <td>
+              {% if report.status == 'current' %}
+              <span class="badge ok">当前</span>
+              {% else %}
+              <span class="badge err">过期</span>
+              {% endif %}
+            </td>
+            <td class="num">{{ report.missing_count }} / {{ report.point_count }}</td>
+            <td class="num">{{ report.intervals|length }} 段</td>
+            <td class="num">{{ report.basis_batch_ids|length }}</td>
+            <td class="num muted">{{ report.created_at }}</td>
+            <td><div class="row-actions"><a href="/gaps/{{ report.id }}">查看</a></div></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="muted">还没有核对报告。填写上方条件生成第一份。</p>
+    {% endif %}
+  </section>
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 报告的批次集合与缺测结论来自同一个已提交状态；相关补传会立即使报告过期。
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

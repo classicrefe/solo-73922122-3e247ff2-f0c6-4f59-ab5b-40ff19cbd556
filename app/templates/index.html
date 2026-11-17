@@ -14,6 +14,10 @@
 </header>
 
 <main>
+  <div class="crumbs" style="margin-bottom:14px">
+    <a href="/gaps">缺测核对页 →</a>
+    <span class="muted" style="margin-left:8px">按站号 / UTC 窗口 / 采样间隔核对缺测并生成可刷新报告</span>
+  </div>
   {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
   {% if latest is not none and latest != ack %}
   <div class="flash error">

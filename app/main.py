@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import lake
+from . import gaps, lake
 from .lake import (
     MAX_FIELDS,
     MAX_ROWS,
@@ -36,6 +36,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         lake.initialize(resolved)
+        gaps.reconcile_on_startup(resolved)
         log.info(
             "instance=%s data_dir=%s db=%s",
             resolved.instance_name,
@@ -122,6 +123,86 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rows=rows,
             ack=view.schema.version,
             latest=_latest_version(resolved),
+            msg=request.query_params.get("msg"),
+            kind=request.query_params.get("kind", "info"),
+        )
+
+    # ------------------------------------------------------------------
+    # 缺测核对网页
+    # ------------------------------------------------------------------
+
+    @app.get("/gaps", response_class=HTMLResponse)
+    def gaps_page(request: Request):
+        reports = gaps.list_reports(resolved)
+        try:
+            stations = gaps.known_stations(resolved)
+        except LakeError:
+            stations = []
+        return _render(
+            request,
+            "gaps.html",
+            settings=resolved,
+            reports=reports,
+            stations=stations,
+            intervals=gaps.ALLOWED_INTERVALS,
+            msg=request.query_params.get("msg"),
+            kind=request.query_params.get("kind", "info"),
+        )
+
+    @app.post("/gaps")
+    def create_gap_form(
+        request: Request,
+        station_id: str = Form(...),
+        start_at: str = Form(...),
+        end_at: str = Form(...),
+        interval_minutes: str = Form(...),
+    ):
+        report = gaps.create_report(
+            resolved, station_id, start_at, end_at, interval_minutes
+        )
+        message = (
+            f"报告 {report.short_id} 已生成：{report.point_count} 个网格点，"
+            f"缺测 {report.missing_count} 个，连续缺测区间 {len(report.intervals)} 段。"
+        )
+        if report.status == gaps.STATUS_STALE:
+            message += " 计算期间出现相关补传，报告已直接标记为过期，请刷新重算。"
+            kind = "error"
+        else:
+            kind = "ok"
+        return _redirect_with_message(
+            request, message, kind, path=f"/gaps/{report.id}"
+        )
+
+    @app.post("/gaps/{report_id}/refresh")
+    def refresh_gap_form(request: Request, report_id: str):
+        report = gaps.refresh_report(resolved, report_id)
+        if report.status == gaps.STATUS_STALE:
+            message = (
+                "刷新计算期间又出现相关补传，报告仍为过期；"
+                "此前报告与结论已原样保留，请稍后再次刷新。"
+            )
+            kind = "error"
+        else:
+            message = (
+                f"已按当前已提交批次重新计算：缺测 {report.missing_count} 个网格点，"
+                f"连续缺测区间 {len(report.intervals)} 段，报告现为当前状态。"
+            )
+            kind = "ok"
+        return _redirect_with_message(
+            request, message, kind, path=f"/gaps/{report_id}"
+        )
+
+    @app.get("/gaps/{report_id}", response_class=HTMLResponse)
+    def gap_detail_page(request: Request, report_id: str):
+        report = gaps.get_report(resolved, report_id)
+        state = lake.read_state(resolved)
+        by_id = {batch.id: batch for batch in state.batches}
+        return _render(
+            request,
+            "gap.html",
+            settings=resolved,
+            report=report,
+            batches_by_id=by_id,
             msg=request.query_params.get("msg"),
             kind=request.query_params.get("kind", "info"),
         )
@@ -293,6 +374,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "temp_files": list(report.temp_files),
         }
 
+    # ------------------------------------------------------------------
+    # 缺测核对 JSON API
+    # ------------------------------------------------------------------
+
+    @app.get("/api/gap-reports")
+    def api_gap_reports():
+        return {"reports": [_gap_payload(r) for r in gaps.list_reports(resolved)]}
+
+    @app.post("/api/gap-reports", status_code=201)
+    async def api_create_gap_report(request: Request):
+        payload = await _json_body(request)
+        report = gaps.create_report(
+            resolved,
+            payload.get("station_id"),
+            payload.get("start_at"),
+            payload.get("end_at"),
+            payload.get("interval_minutes"),
+        )
+        return JSONResponse(_gap_payload(report), status_code=201)
+
+    @app.post("/api/gap-reports/{report_id}/refresh")
+    def api_refresh_gap_report(report_id: str):
+        return _gap_payload(gaps.refresh_report(resolved, report_id))
+
+    @app.get("/api/gap-reports/{report_id}")
+    def api_gap_report(report_id: str):
+        return _gap_payload(gaps.get_report(resolved, report_id))
+
     return app
 
 
@@ -427,6 +536,52 @@ def _batch_payload(batch: lake.Batch) -> dict:
         "file_name": batch.file_name,
         "file_sha256": batch.file_sha256,
         "fields_at_upload": list(batch.fields_at_upload),
+    }
+
+
+def _gap_payload(report: gaps.GapReport) -> dict:
+    return {
+        "id": report.id,
+        "short_id": report.short_id,
+        "station_id": report.station_id,
+        "start_at": lake.format_utc(report.start_at),
+        "end_at": lake.format_utc(report.end_at),
+        "interval_minutes": report.interval_minutes,
+        "status": report.status,
+        "created_at": report.created_at,
+        "computed_at": report.computed_at,
+        "refreshed_at": report.refreshed_at,
+        "point_count": report.point_count,
+        "observed_count": report.observed_count,
+        "missing_count": report.missing_count,
+        "basis_batch_ids": list(report.basis_batch_ids),
+        "basis_batch_count": len(report.basis_batch_ids),
+        "snapshot_batch_count": report.snapshot_batch_count,
+        "stale_reason_batch_id": report.stale_reason_batch_id,
+        "stale_at": report.stale_at,
+        "grid": [
+            {
+                "observed_at": lake.format_utc(point.observed_at),
+                "observed": point.observed,
+                "batch_ids": list(point.batch_ids),
+            }
+            for point in report.grid
+        ],
+        "missing_intervals": [
+            {
+                "start_at": lake.format_utc(item.start_at),
+                "end_at": lake.format_utc(item.end_at),
+                "point_count": item.point_count,
+            }
+            for item in report.intervals
+        ],
+        "offgrid_observations": [
+            {
+                "observed_at": lake.format_utc(item.observed_at),
+                "batch_id": item.batch_id,
+            }
+            for item in report.offgrid
+        ],
     }
 
 

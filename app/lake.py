@@ -298,6 +298,10 @@ def initialize(settings: Settings) -> None:
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, '0')",
                 (SCHEMA_VERSION_KEY,),
             )
+            # 缺测核对表与核心表在同一事务内创建；延迟导入避免循环依赖。
+            from . import gaps
+
+            gaps.ensure_schema(conn)
             conn.execute("COMMIT")
             _cleanup_stale_temps(settings)
             _cleanup_orphan_files(settings)
@@ -910,6 +914,7 @@ def upload_csv(settings: Settings, expected_version: int, data: bytes) -> Batch:
             file_sha256=file_sha256,
             schema_json=schema_json,
             fields_at_upload=fields_at_upload,
+            station_time_pairs=list(zip(parsed.stations, parsed.times)),
         )
     except BaseException:
         _safe_unlink(final_path)
@@ -931,6 +936,7 @@ def _commit_batch(
     file_sha256: str,
     schema_json: str,
     fields_at_upload: Sequence[dict],
+    station_time_pairs: Sequence[tuple[str, datetime]],
 ) -> Batch:
     try:
         with _write_transaction(settings) as conn:
@@ -947,6 +953,13 @@ def _commit_batch(
                     file_sha256,
                     schema_json,
                 ),
+            )
+            # 与批次登记同一事务：相关站号的当前缺测报告原子置过期。
+            # 延迟导入避免 lake <-> gaps 循环依赖。
+            from . import gaps
+
+            gaps.mark_reports_for_committed_batch(
+                conn, batch_id, list(station_time_pairs), created_at
             )
     except LakeError:
         raise

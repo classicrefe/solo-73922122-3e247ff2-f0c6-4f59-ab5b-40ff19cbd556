@@ -599,7 +599,11 @@ def dual_instances(tmp_path: Path):
         stop_files.append(stop_file)
         env = {
             **os.environ,
-            "PYTHONPATH": str(ROOT),
+            # 追加而不是覆盖：在已配置好依赖的环境（venv / 容器）中保持原样，
+            # 仅在依赖位于外部 PYTHONPATH 目录时把该路径带给子进程。
+            "PYTHONPATH": os.pathsep.join(
+                p for p in [str(ROOT), os.environ.get("PYTHONPATH")] if p
+            ),
             "DATA_DIR": str(data_dir),
             "INSTANCE_NAME": f"node{idx + 1}",
             "METLAKE_STOP_FILE": str(stop_file),
